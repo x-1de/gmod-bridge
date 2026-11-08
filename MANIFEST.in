@@ -2,6 +2,7 @@ include LICENSE README.md CHANGELOG.md CONTRIBUTING.md THIRD_PARTY.md requiremen
 recursive-include scripts *.py
 recursive-include tests *.py
 recursive-include .github *.yml *.md
+recursive-include docs *.svg *.png *.md
 global-exclude *.pyc
 prune build
 prune dist

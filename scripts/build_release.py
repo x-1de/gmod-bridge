@@ -29,6 +29,8 @@ def main():
         raise RuntimeError("Packaged application did not create its smoke-test report")
     for name in ("README.md", "LICENSE", "THIRD_PARTY.md", "CHANGELOG.md"):
         shutil.copy2(ROOT / name, folder / name)
+    if (ROOT / "docs").is_dir():
+        shutil.copytree(ROOT / "docs", folder / "docs", dirs_exist_ok=True)
     notices = folder / "THIRD_PARTY_LICENSES"
     notices.mkdir(exist_ok=True)
     dependencies = ["PySide6_Essentials", "shiboken6", "Pillow", "numpy", "pyinstaller"]

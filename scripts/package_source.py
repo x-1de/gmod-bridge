@@ -11,9 +11,9 @@ def main():
     out = ROOT / "dist" / "GModBridge-source.zip"
     out.parent.mkdir(exist_ok=True)
     files = [ROOT / name for name in FILES]
-    for folder in ("gm2b", "scripts", "tests", ".github"):
+    for folder in ("gm2b", "scripts", "tests", ".github", "docs"):
         files.extend(p for p in (ROOT / folder).rglob("*") if p.is_file()
-                     and "__pycache__" not in p.parts and p.suffix in {".py", ".yml", ".md"})
+                     and "__pycache__" not in p.parts and p.suffix in {".py", ".yml", ".md", ".svg", ".png"})
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
         for p in sorted(files):
             archive.write(p, "gmod-bridge/" + p.relative_to(ROOT).as_posix())
