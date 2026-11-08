@@ -1,0 +1,7 @@
+include LICENSE README.md CHANGELOG.md CONTRIBUTING.md THIRD_PARTY.md requirements.txt run.py
+recursive-include scripts *.py
+recursive-include tests *.py
+recursive-include .github *.yml *.md
+global-exclude *.pyc
+prune build
+prune dist
