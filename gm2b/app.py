@@ -1014,7 +1014,7 @@ class MainWindow(QMainWindow):
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
         for i, (name, title) in enumerate((("import", "Из GMod"), ("addon", "В GMod"),
-                                           ("person", "Свой персонаж"), ("settings", "Настройки"))):
+                                           ("person", "Свой персонаж · БЕТА"), ("settings", "Настройки"))):
             b = QPushButton(icon(name, "#8b91a1", "#ffffff", 19), f"   {title}", objectName="Nav", checkable=True)
             b.setIconSize(QSize(19, 19))
             b.clicked.connect(lambda _=False, i=i: self.stack.setCurrentIndex(i))

@@ -95,9 +95,6 @@ def build_joints(markers, bones, W_std, H, depth, verts):
         y = v[2] if len(v) > 2 and v[2] is not None else depth(x, z)
         return Vector((x, y, z))
 
-    def at(x, z):
-        return Vector((x, depth(x, z), z))
-
     P = {}
     P["Bip01_Pelvis"] = mk("groin", 0.055 * H)
     P["Bip01_Head1"] = mk("chin", 0.035 * H)
@@ -118,7 +115,8 @@ def build_joints(markers, bones, W_std, H, depth, verts):
         chain = ("Bip01_Spine", "Bip01_Spine1", "Bip01_Spine2", "Bip01_Spine4", "Bip01_Neck1")
     for n in chain:  # позвоночник — между тазом и шеей, в пропорциях эталона
         t = (P_std[n].z - zp) / (zn - zp)
-        P[n] = at(pelvis.x + (neck.x - pelvis.x) * t, pelvis.z + t * (neck.z - pelvis.z))
+        # Preserve the depth explicitly placed in the side view (including a bent torso).
+        P[n] = pelvis.lerp(neck, t)
     extra = {}
     s_hand = {}
     for side, s in (("R", "r"), ("L", "l")):
@@ -148,6 +146,9 @@ def build_joints(markers, bones, W_std, H, depth, verts):
             length = max([r for r in reach if r > 0], default=STD_HAND_LENGTH)
         if f"thumb_{s}" in markers:
             extra[f"thumb_{side}"] = mk(f"thumb_{s}")
+        for digit, key in enumerate(("thumb", "index_tip", "fingertip", "ring_tip", "pinky_tip")):
+            if f"{key}_{s}" in markers:
+                extra[f"finger_{side}_{digit}"] = mk(f"{key}_{s}")
         s_hand[side] = min(max(length / STD_HAND_LENGTH, 0.5), 2.0)
     return P, P_std, s_torso, s_hand, extra
 
@@ -183,11 +184,7 @@ def hand_swing(n, R_std, P, P_std, extra):
             ROLL_LOG[side] = "пропущен: большой палец слишком близко к оси кисти"
             return q
         angle = math.atan2(axis.dot(u_std.cross(u)), u_std.dot(u))
-        if abs(math.degrees(angle)) > 60:
-            # у ладони в T/A-позе поворот небольшой; больше 60° — почти наверняка точка
-            # большого пальца стоит не там (например, на предмете в руке)
-            ROLL_LOG[side] = f"пропущен: {math.degrees(angle):+.0f}° — проверьте точку большого пальца"
-            return q
+        # Trust explicit 3D markers: palms facing forward/back can legitimately need >60°.
         q = Quaternion(axis, angle) @ q
         ROLL_LOG[side] = f"{math.degrees(angle):+.0f}°"
     return q
@@ -204,19 +201,21 @@ def build_skeleton(bones, W_std, P, P_std, s_torso, s_hand, extra=None):
     for i, b in enumerate(bones):
         n = names[i]
         R_std = W_std[i].to_3x3()
-        if n in HELPERS or is_finger(n):
+        if n in HELPERS or is_finger(n) or b.get("palm_tip"):
             # вспомогательные кости и пальцы — локальная позиция эталона, масштаб по телу / кисти
             parent = W[b["parent"]]
             x, y, z, w = b["quat"]
-            scale = s_hand["R" if "_R_" in n else "L"] if is_finger(n) else s_torso
+            scale = s_hand["R" if "_R_" in n else "L"] if is_finger(n) or b.get("palm_tip") else s_torso
             local = Matrix.Translation(Vector(b["pos"]) * INCH * scale) @ \
                 Quaternion((w, x, y, z)).to_matrix().to_4x4()
             W.append(parent @ local)
             continue
         if n in TORSO:
             q = Quaternion()  # таз, позвоночник, шея, голова — ориентация эталона
-        elif n.endswith("_Hand") and hand_swing(n, R_std, P, P_std, extra) is not None:
+        elif n.endswith("_Hand"):
             q = hand_swing(n, R_std, P, P_std, extra)
+            if q is None:
+                q = swing[names[b["parent"]]]
         elif n in LEN_CHILD:
             c = LEN_CHILD[n]
             q = (P_std[c] - P_std[n]).normalized().rotation_difference((P[c] - P[n]).normalized())
@@ -224,7 +223,37 @@ def build_skeleton(bones, W_std, P, P_std, s_torso, s_hand, extra=None):
             q = swing[names[b["parent"]]]  # концевые кости (кисть, носок) — как у родителя
         swing[n] = q
         W.append(Matrix.Translation(P[n]) @ (q.to_matrix() @ R_std).to_4x4())
+    fit_fingers(bones, W, extra)
     return W
+
+
+def fit_fingers(bones, W, extra):
+    """Fit each complete three-bone chain to its own tip without changing animation parents.
+
+    Phalanx proportions come from ValveBiped; positions and orientations are fitted in 3D.
+    The target includes the visible terminal phalanx, rather than ending at its last joint.
+    """
+    index = {short(b["name"]): i for i, b in enumerate(bones)}
+    for side in ("R", "L"):
+        for digit in range(5):
+            root = f"Bip01_{side}_Finger{digit}"
+            chain = [index.get(root + suffix) for suffix in ("", "1", "2")]
+            target = extra.get(f"finger_{side}_{digit}")
+            if target is None or any(i is None for i in chain):
+                continue
+            first, middle, last = (W[i].to_translation() for i in chain)
+            end = last + (last - middle) * 0.8
+            original, desired = end - first, target - first
+            if original.length < 1e-6 or desired.length < 1e-6:
+                raise ValueError(f"Точка пальца {side}/{digit} совпадает с суставом — передвиньте её")
+            ratio = desired.length / original.length
+            if not 0.25 <= ratio <= 3.0:
+                raise ValueError(f"Проверьте точку пальца {side}/{digit}: длина отличается от эталона "
+                                 "более чем в 3–4 раза")
+            rotation = original.normalized().rotation_difference(desired.normalized()).to_matrix()
+            for i in chain:
+                p = first + (rotation @ (W[i].to_translation() - first)) * ratio
+                W[i] = Matrix.Translation(p) @ (rotation @ W[i].to_3x3()).to_4x4()
 
 
 def make_armature(bones, W, P, H):
@@ -257,6 +286,9 @@ def make_armature(bones, W, P, H):
             tail = P[LEN_CHILD[n]]
         elif n in tails:
             tail = tails[n]
+        elif b.get("palm_tip"):
+            tip_index = next(j for j, item in enumerate(bones) if item["name"] == b["palm_tip"])
+            tail = W[tip_index].to_translation()
         elif is_finger(n):
             kids = [k for k in children.get(i, []) if is_finger(names[k])]
             if kids:
@@ -301,7 +333,11 @@ def weight_mesh(body, arm_obj, H):
     proxy.select_set(True)
     arm_obj.select_set(True)
     bpy.context.view_layer.objects.active = arm_obj
-    bpy.ops.object.parent_set(type="ARMATURE_AUTO")
+    try:
+        bpy.ops.object.parent_set(type="ARMATURE_AUTO")
+    except RuntimeError as exc:
+        # Heat weights can fail on intersecting clothes or open meshes; keep the wizard usable.
+        log(f"heat-веса недоступны, используем связные кости: {exc}")
 
     bone_names = {b.name for b in arm_obj.data.bones if b.use_deform}
     names = {vg.index: vg.name for vg in proxy.vertex_groups}
@@ -316,13 +352,15 @@ def weight_mesh(body, arm_obj, H):
     groups = {b.name: body.vertex_groups.new(name=b.name) for b in deform}
     auto = fallback = 0
     for v in body.data.vertices:
-        _co, idx, _d = kd.find(v.co)
-        weights = proxy_w[idx]
+        found = kd.find(v.co) if proxy_me.vertices else None
+        weights = proxy_w[found[1]] if found else []
         if sum(w for _, w in weights) > 1e-4:
             auto += 1
         else:
-            # мягкий запасной вариант: две ближайшие кости, вес обратно пропорционален расстоянию
-            d = sorted((_dist_to_segment(v.co, b.head_local, b.tail_local), b.name) for b in deform)[:2]
+            # Blend along a skeleton chain, never between unrelated nearby limbs/fingers.
+            nearest = min(deform, key=lambda b: _dist_to_segment(v.co, b.head_local, b.tail_local))
+            adjacent = [b for b in deform if b == nearest or b.parent == nearest or nearest.parent == b]
+            d = sorted((_dist_to_segment(v.co, b.head_local, b.tail_local), b.name) for b in adjacent)[:2]
             inv = [(n, 1.0 / max(dist, 1e-4) ** 4) for dist, n in d]
             total = sum(w for _, w in inv)
             weights = [(n, w / total) for n, w in inv]
@@ -401,6 +439,17 @@ def fix_head_attachments(body, P, H):
         a, b = find(e.vertices[0]), find(e.vertices[1])
         if a != b:
             parent[a] = b
+    # UV seams duplicate positions. Classify them as connected without changing mesh/UVs.
+    from mathutils.kdtree import KDTree
+    kd = KDTree(n)
+    for v in me.vertices:
+        kd.insert(v.co, v.index)
+    kd.balance()
+    for v in me.vertices:
+        for _co, j, _distance in kd.find_range(v.co, H * 1e-5):
+            a, b = find(v.index), find(j)
+            if a != b:
+                parent[a] = b
     islands = {}
     for i in range(n):
         islands.setdefault(find(i), []).append(i)
@@ -683,7 +732,7 @@ def main():
     region_of = {}
     for n in names:
         target = n if VB + n in solids else REGION.get(n)
-        if is_finger(n):  # пальцы — часть формы кисти
+        if is_finger(n) or "_Palm" in n:  # пальцы и пясть — часть формы кисти
             target = "Bip01_R_Hand" if "_R_" in n else "Bip01_L_Hand"
         region_of[n] = VB + target if target and VB + target in solids else None
     pts = {s: [] for s in solids}

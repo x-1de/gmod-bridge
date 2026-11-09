@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 import struct
@@ -30,6 +31,7 @@ RIG = HERE / "blender_char_rig.py"
 STANDARD_HEIGHT_IN = 72.0  # рост стандартного игрока в юнитах Source
 SKELETON_BONES = 26        # первые 26 костей эталона: тело + вспомогательные
 SKELETON_WITH_FINGERS = 56  # + по 15 костей пальцев на руку
+SKELETON_WITH_PALMS = 64    # + четыре кости пясти на каждую руку
 
 GENDERS = {
     "male": {"anims": "m_anm.mdl", "phy": "models/humans/group01/male_07.phy", "hands": "models/weapons/c_arms_citizen.mdl"},
@@ -70,8 +72,18 @@ def standard_skeleton(gmod_dir, gender: str, count: int = SKELETON_BONES) -> lis
     """Эталонный скелет ValveBiped из анимаций игрока (m_anm / f_anm)."""
     vfs = VirtualFS(game_sources(Path(gmod_dir)))
     mdl = Mdl(vfs.read("models/" + GENDERS[gender]["anims"]))
-    return [{"name": b.name, "parent": b.parent, "pos": list(b.pos), "quat": list(b.quat)}
-            for b in mdl.bones[:count]]
+    bones = [{"name": b.name, "parent": b.parent, "pos": list(b.pos), "quat": list(b.quat)}
+             for b in mdl.bones[:min(count, SKELETON_WITH_FINGERS)]]
+    if count > SKELETON_WITH_FINGERS:
+        for side in ("R", "L"):
+            hand = next(i for i, b in enumerate(bones) if b["name"] == f"ValveBiped.Bip01_{side}_Hand")
+            for finger in range(1, 5):
+                root = next(b for b in bones if b["name"] == f"ValveBiped.Bip01_{side}_Finger{finger}")
+                # Independent children of Hand: the animation hierarchy stays unchanged.
+                bones.append({"name": f"ValveBiped.Bip01_{side}_Palm{finger}", "parent": hand,
+                              "pos": [v * 0.3 for v in root["pos"]], "quat": [0, 0, 0, 1],
+                              "palm_tip": root["name"]})
+    return bones
 
 
 IMAGE_EXT = (".png", ".jpg", ".jpeg", ".tga", ".bmp", ".dds", ".tif", ".tiff", ".webp")
@@ -158,15 +170,42 @@ def prepare(input_path: str, blender: str, height_in: float, rotate: float, log:
 
 
 def rig(session: CharacterSession, markers: dict, blender: str, gmod_dir, gender: str, log: Log,
-        fingers: bool = True, textures: dict | None = None):
+        fingers: bool = True, textures: dict | None = None, palms: bool = True):
     """markers: {точка: [x, z, y]} в метрах; y (глубина с вида сбоку) может быть None."""
+    validate_markers(markers, session.prepare["height_m"])
     solids, _masses, _joints = ragdoll_template(gmod_dir, gender)
-    count = SKELETON_WITH_FINGERS if fingers else SKELETON_BONES
+    count = (SKELETON_WITH_PALMS if palms else SKELETON_WITH_FINGERS) if fingers else SKELETON_BONES
     _blender(blender, RIG, {"out_dir": str(session.work), "height_m": session.prepare["height_m"],
                             "markers": markers, "bones": standard_skeleton(gmod_dir, gender, count),
                             "solids": solids, "textures": textures or {}}, session.work, log)
     session.rig = json.loads((session.work / "rig.json").read_text(encoding="utf-8"))
     return session
+
+
+def validate_markers(markers: dict, height: float):
+    """Reject invalid/overlapping joints before starting Blender, with actionable feedback."""
+    if not math.isfinite(height) or height <= 0:
+        raise ValueError("Рост персонажа должен быть больше нуля")
+    required = {"groin", "chin"} | {f"{k}_{s}" for s in ("r", "l")
+                                         for k in ("shoulder", "elbow", "wrist", "knee", "ankle")}
+    missing = required - markers.keys()
+    if missing:
+        raise ValueError("Не заданы точки: " + ", ".join(sorted(missing)))
+    for key, coords in markers.items():
+        if len(coords) not in (2, 3) or any(
+                not isinstance(v, (int, float)) or not math.isfinite(v)
+                for i, v in enumerate(coords) if i < 2 or v is not None):
+            raise ValueError(f"Недопустимые координаты точки {key}")
+    for side in ("r", "l"):
+        for a, b in (("shoulder", "elbow"), ("elbow", "wrist"), ("hip", "knee"),
+                     ("knee", "ankle"), ("ankle", "toe"), ("wrist", "fingertip")):
+            a, b = f"{a}_{side}", f"{b}_{side}"
+            if a not in markers or b not in markers:
+                continue
+            aa, bb = markers[a], markers[b]
+            axes = 3 if len(aa) == len(bb) == 3 and aa[2] is not None and bb[2] is not None else 2
+            if math.dist(aa[:axes], bb[:axes]) < height * 0.002:
+                raise ValueError(f"Точки {a} и {b} слишком близко — раздвиньте суставы")
 
 
 def depth_at(session: CharacterSession, x: float, z: float, spread: float = 0.0) -> float:

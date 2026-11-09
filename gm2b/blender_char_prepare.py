@@ -175,6 +175,21 @@ def guess_markers(body, H, front, grid):
         out[f"wrist_{s}"] = [wrist.x, wrist.z]
         out[f"fingertip_{s}"] = [tip.x, tip.z]
         out[f"thumb_{s}"] = thumb_tip(vs, wrist, tip)
+        thumb = out[f"thumb_{s}"]
+        thumb = Vector((thumb[0], thumb[2], thumb[1]))
+        axis = (tip - wrist).normalized()
+        across = thumb - wrist
+        across -= axis * across.dot(axis)
+        if across.length < 0.01 * H:
+            across = Vector((0, 0, -0.025 * H))
+        # Initial guesses only: distinct fingertips can be corrected on both views.
+        for key, reach, lane in (("index_tip", 0.94, 0.45), ("ring_tip", 0.92, -0.4),
+                                  ("pinky_tip", 0.75, -0.8)):
+            seed = wrist + (tip - wrist) * reach + across * lane
+            candidates = [v for v in vs if (v - seed).length < 0.018 * H
+                          and (v - wrist).dot(axis) > 0.5 * (tip - wrist).length]
+            p = min(candidates, key=lambda v: (v - seed).length) if candidates else seed
+            out[f"{key}_{s}"] = [p.x, p.z, p.y]
         knee_x = centroid(knee_z, sign, 0.2 * H)
         ankle_x = centroid(ankle_z, sign, 0.2 * H)
         out[f"hip_{s}"] = [sign * max(abs(knee_x), 0.05 * H), groin_z + 0.035 * H]

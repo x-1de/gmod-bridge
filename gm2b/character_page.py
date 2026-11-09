@@ -12,13 +12,14 @@ from PySide6.QtGui import QBrush, QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame, QGraphicsEllipseItem,
     QGraphicsItem, QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsView, QGridLayout, QHBoxLayout,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QPushButton, QStackedWidget, QVBoxLayout, QWidget,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QPushButton, QScrollArea, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from .addon_builder import INPUT_EXTENSIONS
 from .icons import icon
 from .playermodel_builder import (
     IMAGE_EXT, PlayermodelOptions, build, default_depth, match_textures, prepare, rig,
+    validate_markers,
 )
 from .theme import ACCENT, BAD, OK
 
@@ -35,6 +36,9 @@ MARKERS = [
     *_pair("wrist", "Запястье", "#ff8a3d"),
     *_pair("thumb", "Большой палец", "#ffe08a"),
     *_pair("fingertip", "Кончики пальцев", "#ffb3c1"),
+    *_pair("index_tip", "Указательный", "#f0c987"),
+    *_pair("ring_tip", "Безымянный", "#d7aefb"),
+    *_pair("pinky_tip", "Мизинец", "#8edbe5"),
     ("groin", "Пах", "#6ec6ff", None),
     *_pair("hip", "Бедро", "#8fa8ff"),
     *_pair("knee", "Колено", "#5fd38d"),
@@ -44,7 +48,8 @@ MARKERS = [
 HINTS = {"Подбородок": "низ подбородка", "Шея": "основание шеи, между ключицами",
          "Плечо": "центр плечевого сустава", "Локоть": "сгиб руки", "Запястье": "где кисть переходит в руку",
          "Большой палец": "кончик большого пальца — по нему поворачивается ладонь",
-         "Кончики пальцев": "кончик среднего пальца", "Пах": "развилка ног",
+         "Кончики пальцев": "кончик среднего пальца", "Указательный": "кончик указательного пальца",
+         "Безымянный": "кончик безымянного пальца", "Мизинец": "кончик мизинца", "Пах": "развилка ног",
          "Бедро": "тазобедренный сустав (верх ноги)", "Колено": "центр колена",
          "Щиколотка": "косточка над стопой", "Носок": "подушечка стопы (основание пальцев ног)"}
 # на виде сбоку левая и правая точки совпадают — одна точка на пару
@@ -53,9 +58,16 @@ SIDE = {"chin": ["chin"], "neck": ["neck"], "shoulder": ["shoulder_r", "shoulder
         "groin": ["groin"], "hip": ["hip_r", "hip_l"], "knee": ["knee_r", "knee_l"],
         "ankle": ["ankle_r", "ankle_l"], "toe": ["toe_r", "toe_l"]}
 SIDE_OF = {k: s for s, keys in SIDE.items() for k in keys}
+# Each fingertip has a depth marker too; front-only placement cannot fit curled hands.
+for _finger_key in ("fingertip", "index_tip", "ring_tip", "pinky_tip"):
+    for _s in ("r", "l"):
+        _k = f"{_finger_key}_{_s}"
+        SIDE[_k] = [_k]
+        SIDE_OF[_k] = _k
 # у этих точек глубина задана по самой модели (вершина), а не серединой тела —
 # при сдвиге спереди её не пересчитываем, пока пользователь не поправит сбоку
-KEEP_DEPTH = {"thumb", "toe"}
+KEEP_DEPTH = {"thumb", "toe", "fingertip_r", "fingertip_l", "index_tip_r", "index_tip_l",
+              "ring_tip_r", "ring_tip_l", "pinky_tip_r", "pinky_tip_l"}
 STEPS = ["Модель", "Текстуры", "Точки", "Проверка", "Сборка"]
 
 
@@ -79,6 +91,10 @@ class Marker(QGraphicsEllipseItem):
         self.label.setBrush(QBrush(QColor("#e7e9ef")))
         self.label.setFont(QFont("Segoe UI Variable Text", 8, QFont.Weight.DemiBold))
         self.label.setPos(self.R + 3, -self.R)
+        self.compact_label = any(key.startswith(k) for k in ("thumb", "fingertip", "index_tip", "ring_tip", "pinky_tip"))
+        self.label.setVisible(not self.compact_label)
+        self.setToolTip(title)
+        self.setAcceptHoverEvents(True)
         self.quiet = False
 
     def place(self, x, y):
@@ -94,6 +110,15 @@ class Marker(QGraphicsEllipseItem):
     def mousePressEvent(self, e):
         self.canvas.select(self)
         super().mousePressEvent(e)
+
+    def hoverEnterEvent(self, event):
+        self.label.setVisible(True)
+        super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event):
+        if self.compact_label and self.canvas.active is not self:
+            self.label.setVisible(False)
+        super().hoverLeaveEvent(event)
 
 
 class Canvas(QGraphicsView):
@@ -179,8 +204,13 @@ class Canvas(QGraphicsView):
     def select(self, marker: Marker):
         if self.active is not None and self.active is not marker:
             self.active.setPen(QPen(QColor("#0f1115"), 2.5))
+            self.active.setZValue(10)
+            if self.active.compact_label:
+                self.active.label.setVisible(False)
         self.active = marker
         marker.setPen(QPen(QColor("#ffffff"), 2.5))
+        marker.label.setVisible(True)
+        marker.setZValue(20)
         self.setFocus()
 
     def keyPressEvent(self, e):
@@ -266,11 +296,18 @@ class CharacterPage(QWidget):
         lay.setContentsMargins(28, 24, 28, 18)
         lay.setSpacing(14)
         head = QHBoxLayout()
-        head.addLayout(page_header("Свой персонаж",
-                                   "Модель без костей → playermodel с анимациями игрока, как в Mixamo"))
+        head.addLayout(page_header("Свой персонаж · БЕТА",
+                                   "Создание персонажа в бета-тестировании — проверяйте сгибы и хват оружия в игре"))
         head.addStretch()
         head.addLayout(self._build_stepper())
         lay.addLayout(head)
+        beta = QLabel("БЕТА · Автоматические кости и веса могут требовать ручной правки. "
+                      "Перед сборкой проверьте модель спереди и сбоку и тестовую позу.")
+        beta.setObjectName("CharacterBetaNotice")
+        beta.setWordWrap(True)
+        beta.setStyleSheet("background: #30271e; color: #f0c987; border: 1px solid #695033; "
+                           "border-radius: 8px; padding: 10px 14px;")
+        lay.addWidget(beta)
 
         row = QHBoxLayout()
         row.setSpacing(16)
@@ -302,7 +339,13 @@ class CharacterPage(QWidget):
         self.panels = QStackedWidget(objectName="Panels")
         for build_panel in (self._panel_model, self._panel_textures, self._panel_points,
                             self._panel_check, self._panel_build):
-            self.panels.addWidget(build_panel())
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            scroll.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }")
+            scroll.setWidget(build_panel())
+            self.panels.addWidget(scroll)
         side_card, sl = card(margins=20)
         sl.addWidget(self.panels)
         side_card.setMinimumWidth(390)
@@ -561,15 +604,21 @@ class CharacterPage(QWidget):
         legend.setColumnStretch(1, 1)
         legend.setColumnStretch(3, 1)
         lay.addLayout(legend)
-        self.sym_box = QCheckBox("Симметрия (левая и правая стороны вместе)")
+        self.sym_box = QCheckBox("Симметрия левой и правой сторон")
         self.sym_box.setChecked(True)
         self.sym_box.toggled.connect(lambda v: setattr(self.canvas, "symmetric", v))
         lay.addWidget(self.sym_box)
-        self.fingers_box = QCheckBox("Пальцы — по 15 костей на руку (хват оружия)")
+        self.fingers_box = QCheckBox("Пальцы — по 15 костей на руку")
         self.fingers_box.setChecked(True)
         self.fingers_box.setToolTip("Анимации игрока сгибают пальцы вокруг оружия. Выключите, если у модели "
                                     "кисти-варежки или пальцы слиплись в один кусок.")
         lay.addWidget(self.fingers_box)
+        self.palms_box = QCheckBox("Кости пясти (+8, всего 64 кости)")
+        self.palms_box.setChecked(True)
+        self.palms_box.setToolTip("Четыре кости ладони на руку. Следуют за кистью; "
+                                   "стандартные анимации пальцев сохраняются.")
+        self.fingers_box.toggled.connect(self.palms_box.setEnabled)
+        lay.addWidget(self.palms_box)
         self.gender_box = QComboBox()
         self.gender_box.addItem("Мужские анимации", "male")
         self.gender_box.addItem("Женские анимации", "female")
@@ -647,21 +696,28 @@ class CharacterPage(QWidget):
 
     def run_rig(self):
         markers = self.collect_markers()
+        try:
+            validate_markers(markers, self.session.prepare["height_m"])
+        except ValueError as exc:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Проверьте точки", str(exc))
+            return
         session, exe, gmod = self.session, self.win.blender_exe(), self.win.gmod_dir
         gender, fingers, textures = self.gender_box.currentData(), self.fingers_box.isChecked(), dict(self.textures)
+        palms = self.palms_box.isChecked()
 
         def done(s):
             total = s.prepare["vertices"]
             auto = total - s.rig["fixed_vertices"]
             self.weights_label.setText(f"Скелет: {s.rig['bone_count']} костей. Автоматические веса: "
-                                       f"{100 * auto / max(total, 1):.0f}% вершин, остальные (пряди волос, "
-                                       f"мелкие детали) — к ближайшим костям.")
+                                       f"{100 * auto / max(total, 1):.0f}% вершин, остальные — запасные веса "
+                                       f"по соседним костям. Проверьте плечи, кисти и таз в тестовой позе.")
             self.unlock(4)
             self.update_buttons()
             self.go(3)
 
         self.win.run_bg(lambda w: rig(session, markers, exe, gmod, gender, w.log.emit,
-                                      fingers=fingers, textures=textures), done)
+                                      fingers=fingers, textures=textures, palms=palms), done)
 
     # ---------------------------------------------------------------- 4. проверка
 
